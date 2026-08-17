@@ -1,7 +1,13 @@
-torch>=2.1.0
+torch==2.9.1
 transformers>=4.40.0
 datasets>=2.18.0
 pytest>=7.0.0
-
+tensorboard>=2.21.0
+addict>=2.4.0
+modelscope>=1.38.1
+loguru>=0.7.3
+tiktoken>=0.13.0
+sentencepiece>=0.2.0
+pynvml>=13.0.1
 # optional — enables Flash Attention 2 in GQAttention (requires CUDA + build tools)
 # flash-attn>=2.8.3

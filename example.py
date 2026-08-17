@@ -2,7 +2,7 @@ import torch
 from open_mythos.main import OpenMythos, MythosConfig
 
 
-attn_type = "mla"  # or "gqa"
+attn_type = "gqa"  # or "gqa"
 
 base = {
     "vocab_size": 1000,

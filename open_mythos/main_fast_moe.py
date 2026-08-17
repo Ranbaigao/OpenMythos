@@ -83,6 +83,325 @@ class MythosConfig:
     dropout: float = 0.0
 
 
+
+
+
+
+class GroupedSwiGLUExperts(nn.Module):
+    """
+    将 nn.ModuleList([Expert, Expert, ...]) 改成三组堆叠权重。
+
+    权重布局保持和 nn.Linear 一致：
+        gate_weight: (n_experts, expert_dim, dim)
+        up_weight:   (n_experts, expert_dim, dim)
+        down_weight: (n_experts, dim, expert_dim)
+
+    grouped_mm 计算时会通过 transpose(1, 2) 转成：
+        (n_experts, in_dim, out_dim)
+    """
+
+    def __init__(
+        self,
+        n_experts: int,
+        dim: int,
+        expert_dim: int,
+        backend: str = "grouped_mm",
+        capacity_factor: float = 1.25,
+    ):
+        super().__init__()
+
+        assert backend in ("grouped_mm", "bmm")
+
+        self.n_experts = n_experts
+        self.dim = dim
+        self.expert_dim = expert_dim
+        self.backend = backend
+        self.capacity_factor = capacity_factor
+
+        self.gate_weight = nn.Parameter(
+            torch.empty(n_experts, expert_dim, dim)
+        )
+        self.up_weight = nn.Parameter(
+            torch.empty(n_experts, expert_dim, dim)
+        )
+        self.down_weight = nn.Parameter(
+            torch.empty(n_experts, dim, expert_dim)
+        )
+
+        # 原来的 OpenMythos._init_weights() 只处理 nn.Linear 和 nn.Embedding，
+        # 不会初始化这三个裸 Parameter，所以这里必须自己初始化。
+        nn.init.normal_(self.gate_weight, std=0.02)
+        nn.init.normal_(self.up_weight, std=0.02)
+        nn.init.normal_(self.down_weight, std=0.02)
+
+    @torch.no_grad()
+    def load_from_module_list(self, experts: nn.ModuleList):
+        """
+        从原来的 nn.ModuleList([Expert, ...]) 迁移权重。
+
+        要求：
+            len(experts) == self.n_experts
+            每个 Expert 都有 gate/up/down 三个 Linear
+        """
+        assert len(experts) == self.n_experts
+
+        for i, expert in enumerate(experts):
+            self.gate_weight[i].copy_(expert.gate.weight)
+            self.up_weight[i].copy_(expert.up.weight)
+            self.down_weight[i].copy_(expert.down.weight)
+
+    def _pack_tokens(self, x, topk_idx, topk_scores):
+        """
+        将 (token, topk) 形式的专家分配展平，并按 expert_id 排序。
+
+        Args:
+            x:           (num_tokens, dim)
+            topk_idx:    (num_tokens, topk)
+            topk_scores: (num_tokens, topk)
+
+        Returns:
+            x_sorted:        (num_tokens * topk, dim)
+            token_ids:       (num_tokens * topk,)
+            scores:          (num_tokens * topk,)
+            sorted_exp_ids:  (num_tokens * topk,)
+        """
+        num_tokens, topk = topk_idx.shape
+
+        token_ids = (
+            torch.arange(num_tokens, device=x.device)
+            .unsqueeze(1)
+            .expand(num_tokens, topk)
+            .reshape(-1)
+        )
+
+        expert_ids = topk_idx.reshape(-1)
+        scores = topk_scores.reshape(-1)
+
+        sorted_exp_ids, perm = torch.sort(expert_ids)
+
+        token_ids = token_ids[perm]
+        scores = scores[perm]
+        x_sorted = x[token_ids]
+
+        return x_sorted, token_ids, scores, sorted_exp_ids
+
+    @staticmethod
+    def _get_grouped_mm_fn():
+        """
+        新版 PyTorch 使用 F.grouped_mm；
+        较旧版本使用 torch._grouped_mm。
+        """
+        fn = getattr(F, "grouped_mm", None)
+
+        if fn is None:
+            fn = getattr(torch, "_grouped_mm", None)
+
+        return fn
+
+    def _forward_grouped_mm(self, x_sorted, sorted_exp_ids):
+        """
+        真正的 grouped GEMM 路径。
+
+        x_sorted 中的 token 已经按照 expert_id 连续排列：
+
+            [expert_0 tokens | expert_1 tokens | ... | expert_N tokens]
+
+        offsets 是每个专家区间的累计结束位置。
+        """
+        if not x_sorted.is_cuda:
+            raise RuntimeError(
+                "grouped_mm 后端需要 CUDA；CPU 测试请使用 backend='bmm'"
+            )
+
+        grouped_mm = self._get_grouped_mm_fn()
+
+        if grouped_mm is None:
+            raise RuntimeError(
+                "当前 PyTorch 没有 F.grouped_mm 或 torch._grouped_mm，"
+                "请升级 PyTorch，或者使用 backend='bmm'"
+            )
+
+        # PyTorch 2.8 的 torch._grouped_mm CUDA 实现要求 bf16。
+        # 新版本可能放宽该限制，但 bf16 仍然是最推荐路径。
+        if self.gate_weight.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "grouped_mm 路径建议将 grouped expert 权重转为 bf16。\n"
+                "例如：model.recurrent.block.ffn.grouped_experts.to(torch.bfloat16)。\n"
+                "如果你想保持 fp32 master weights + autocast，请使用 backend='bmm'。"
+            )
+
+        x_sorted = x_sorted.to(torch.bfloat16).contiguous()
+
+        # 每个专家的 token 数，不需要搬到 CPU
+        counts = torch.bincount(
+            sorted_exp_ids,
+            minlength=self.n_experts,
+        )
+
+        # grouped_mm 需要 int32 类型的累计结束位置
+        offsets = counts.cumsum(dim=0, dtype=torch.int32)
+
+        # 注意：
+        # self.gate_weight 是 (E, expert_dim, dim)
+        # grouped_mm 需要的是 (E, dim, expert_dim)
+        gate = grouped_mm(
+            x_sorted,
+            self.gate_weight.transpose(1, 2),
+            offs=offsets,
+        )
+
+        up = grouped_mm(
+            x_sorted,
+            self.up_weight.transpose(1, 2),
+            offs=offsets,
+        )
+
+        hidden = F.silu(gate) * up
+
+        # hidden: (M, expert_dim)
+        # self.down_weight.transpose: (E, expert_dim, dim)
+        out = grouped_mm(
+            hidden,
+            self.down_weight.transpose(1, 2),
+            offs=offsets,
+        )
+
+        return out
+
+    def _forward_bmm(self, x_sorted, sorted_exp_ids):
+        """
+        torch.bmm 后备路径。
+
+        优点：
+            - 支持 fp32/autocast；
+            - 不需要 torch._grouped_mm；
+            - 没有 Python expert 循环。
+
+        缺点：
+            - 需要固定 capacity；
+            - 会计算 padding token；
+            - 超过 capacity 的 token 会被丢弃。
+        """
+        total_assignments = x_sorted.size(0)
+
+        # 每个专家的平均 assignment 数
+        average_per_expert = (
+            total_assignments + self.n_experts - 1
+        ) // self.n_experts
+
+        capacity = max(
+            1,
+            int(math.ceil(average_per_expert * self.capacity_factor)),
+        )
+
+        counts = torch.bincount(
+            sorted_exp_ids,
+            minlength=self.n_experts,
+        )
+
+        offsets = counts.cumsum(dim=0)
+        starts = offsets - counts
+
+        # 每个 assignment 在自己专家分组内的局部位置
+        ranks = (
+            torch.arange(total_assignments, device=x_sorted.device)
+            - starts[sorted_exp_ids]
+        )
+
+        valid = ranks < capacity
+
+        # padded layout:
+        # expert_id * capacity + rank
+        slots = sorted_exp_ids * capacity + ranks
+
+        x_padded = x_sorted.new_zeros(
+            self.n_experts * capacity,
+            self.dim,
+        )
+
+        x_padded[slots[valid]] = x_sorted[valid]
+
+        x_padded = x_padded.view(
+            self.n_experts,
+            capacity,
+            self.dim,
+        )
+
+        # (E, C, D) @ (E, D, H) -> (E, C, H)
+        gate = torch.bmm(
+            x_padded,
+            self.gate_weight.transpose(1, 2),
+        )
+
+        up = torch.bmm(
+            x_padded,
+            self.up_weight.transpose(1, 2),
+        )
+
+        hidden = F.silu(gate) * up
+
+        # (E, C, H) @ (E, H, D) -> (E, C, D)
+        y_padded = torch.bmm(
+            hidden,
+            self.down_weight.transpose(1, 2),
+        )
+
+        y_padded = y_padded.reshape(
+            self.n_experts * capacity,
+            self.dim,
+        )
+
+        # 保持输出仍然是固定长度 total_assignments；
+        # 被 capacity 丢弃的位置保持为 0。
+        y_sorted = x_sorted.new_zeros(
+            total_assignments,
+            self.dim,
+        )
+
+        y_sorted[valid] = y_padded[slots[valid]]
+
+        return y_sorted
+
+    def forward(self, x, topk_idx, topk_scores):
+        """
+        Args:
+            x:           (num_tokens, dim)
+            topk_idx:    (num_tokens, topk)
+            topk_scores: (num_tokens, topk)
+
+        Returns:
+            routed_output: (num_tokens, dim)
+        """
+        x_sorted, token_ids, scores, sorted_exp_ids = self._pack_tokens(
+            x,
+            topk_idx,
+            topk_scores,
+        )
+
+        if self.backend == "grouped_mm":
+            y_sorted = self._forward_grouped_mm(
+                x_sorted,
+                sorted_exp_ids,
+            )
+        else:
+            y_sorted = self._forward_bmm(
+                x_sorted,
+                sorted_exp_ids,
+            )
+
+        # 乘上 router gate
+        y_sorted = y_sorted * scores.to(y_sorted.dtype).unsqueeze(-1)
+
+        # 把不同专家的输出加回原始 token 位置
+        out = torch.zeros_like(x)
+        out.index_add_(
+            0,
+            token_ids,
+            y_sorted.to(out.dtype),
+        )
+
+        return out
+
 # ---------------------------------------------------------------------------
 # RMSNorm
 # ---------------------------------------------------------------------------
@@ -486,14 +805,22 @@ class MoEFFN(nn.Module):
         # load-balancing bias adjusted externally during training; not a gradient param
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
 
-        self.routed_experts = nn.ModuleList(
-            [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
-        )
+        # self.routed_experts = nn.ModuleList(
+        #     [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
+        # )
         self.shared_experts = nn.ModuleList(
             [
                 Expert(cfg.dim, cfg.expert_dim * cfg.n_experts_per_tok)
                 for _ in range(self.n_shared)
             ]
+        )
+        
+        self.grouped_experts = GroupedSwiGLUExperts(
+            n_experts=cfg.n_experts,
+            dim=cfg.dim,
+            expert_dim=cfg.expert_dim,
+            backend="grouped_mm",   # 或者 "bmm"
+            capacity_factor=1.25,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -517,36 +844,11 @@ class MoEFFN(nn.Module):
         # =====================================================================
         # 🚀 优化：Grouped/Batched Dispatch (消除慢速嵌套循环)
         # =====================================================================
-        out = torch.zeros_like(flat)
-        num_tokens = flat.size(0)
-
-        # 1. 展平所有的 (token, expert) 索引对
-        token_indices = torch.arange(num_tokens, device=flat.device).unsqueeze(1).expand(-1, self.topk).flatten()
-        expert_indices = topk_idx.flatten()
-        flat_scores = topk_scores.flatten()
-
-        # 2. 根据 expert ID 进行 argsort，将分配给同一个专家的 Token 聚类
-        sorted_expert_indices, sort_idx = torch.sort(expert_indices)
-        sorted_token_indices = token_indices[sort_idx]
-        sorted_scores = flat_scores[sort_idx]
-
-        # 3. unique_consecutive 快速找到专家的分界线 (无需循环 64 个专家，只处理被激活的)
-        unique_experts, counts = torch.unique_consecutive(sorted_expert_indices, return_counts=True)
-
-        # 4. 每个被激活的专家只执行 1 次批量前向传播 (大幅减少 Kernel 发射)
-        offset = 0
-        for exp_id, count in zip(unique_experts.tolist(), counts.tolist()):
-            # 提取分配给该专家的 Token 索引和权重
-            tok_idx = sorted_token_indices[offset:offset+count]
-            w = sorted_scores[offset:offset+count].unsqueeze(1)
-            
-            # 批量输入专家层并加权
-            exp_out = self.routed_experts[exp_id](flat[tok_idx]) * w
-            
-            # 5. Scatter 结果并累加回原张量
-            out.index_add_(0, tok_idx, exp_out)
-            
-            offset += count
+        out = self.grouped_experts(
+            flat,
+            topk_idx,
+            topk_scores,
+        )
         # =====================================================================
 
         # shared experts always fire for every token
@@ -868,12 +1170,7 @@ class RecurrentBlock(nn.Module):
                         each loop iteration uses a separate cache key
 
         Returns:
-            Tuple of:
-                h_out -- ACT-weighted sum of hidden states across iterations,
-                         shape (B, T, dim)
-                act   -- dict with "ponder" (expected loop count per position,
-                         shape (B, T), differentiable) and "loops" (number of
-                         loop iterations actually executed, float)
+            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
@@ -881,15 +1178,8 @@ class RecurrentBlock(nn.Module):
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
-        # Ponder (expected loop count per position) accumulators. Tracked inline
-        # so training can add a budget-style penalty tau*ReLU(ponder - B) that
-        # prevents ACT depth collapse (see docs/act_depth_collapse_analysis.md).
-        ponder_acc = torch.zeros(B, T, device=h.device)
-        mass_acc = torch.zeros(B, T, device=h.device)
-        ran = 0
 
         for t in range(n_loops):
-            ran = t + 1
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
@@ -913,8 +1203,6 @@ class RecurrentBlock(nn.Module):
             )
             weight = weight * still_running.float()
             h_out = h_out + weight.unsqueeze(-1) * h
-            ponder_acc = ponder_acc + (t + 1) * weight
-            mass_acc = mass_acc + weight
 
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
@@ -925,16 +1213,7 @@ class RecurrentBlock(nn.Module):
             if halted.all() and kv_cache is None:
                 break
 
-        # Positions that never halted are charged the full n_loops for their
-        # leftover (unassigned) probability mass.
-        ponder = ponder_acc + n_loops * (1.0 - mass_acc)
-        # Force-exit at the loop budget: pay out the leftover mass with the
-        # final iteration's hidden state. Without this, stragglers' h_out is
-        # attenuated by mass<1 (classic ACT pays the remainder at the last
-        # step); the effect grows as max_loop_iters is reduced.
-        h_out = h_out + (1.0 - mass_acc).clamp(min=0).unsqueeze(-1) * h
-        act = {"ponder": ponder, "loops": float(ran)}
-        return h_out, act
+        return h_out
 
 
 # ---------------------------------------------------------------------------
@@ -1041,7 +1320,6 @@ class OpenMythos(nn.Module):
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
         start_pos: int = 0,
-        return_act: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
@@ -1056,14 +1334,9 @@ class OpenMythos(nn.Module):
                          sequence; used to select the correct RoPE frequencies
                          during incremental decoding (0 for prefill, prompt_len
                          for each subsequent decode step)
-            return_act-- if True, return (logits, act) where act carries the
-                         recurrent block's ponder cost and executed loop count
-                         (used by budget-ponder training to prevent ACT depth
-                         collapse); if False, return logits only
 
         Returns:
-            Logits of shape (B, T, vocab_size), or (logits, act) when
-            return_act is True
+            Logits of shape (B, T, vocab_size)
         """
         T = input_ids.shape[1]
         device = input_ids.device
@@ -1078,15 +1351,12 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x, act = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
-        logits = self.head(self.norm(x))
-        if return_act:
-            return logits, act
-        return logits
+        return self.head(self.norm(x))
 
     @torch.no_grad()
     def generate(

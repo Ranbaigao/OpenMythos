@@ -146,12 +146,51 @@ The training script for the 3B model on FineWeb-Edu is at [`training/3b_fine_web
 
 **Single GPU:**
 ```bash
+conda install -c conda-forge gcc_linux-64 gxx_linux-64
+
+
+export CC=$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc
+export CXX=$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++
+
+
 python training/3b_fine_web_edu.py
+
+
+HF_TOKEN="<your_hf_token>" HF_ENDPOINT="https://hf-mirror.com" nohup python training/0.1b_fine_skywork_act.py > train.log 2>&1 &
+
+nohup tensorboard --logdir runs/ --port 6007 > tensorboard.log 2>&1 &
+
+ssh -p 22875 -L 6008:localhost:6008 root@connect.nmb2.seetacloud.com -N
 ```
 
 **Multi-GPU (auto-detects GPU count):**
 ```bash
+ssh -p 45484 -R 7897:192.168.0.102:7897 root@i-2.gpushare.com
+
+pip install -e . --no-deps
+export HF_TOKEN="<your_hf_token>"
+export HF_ENDPOINT="https://hf-mirror.com"
+
 torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/3b_fine_web_edu.py
+```
+
+评估
+```shell
+# 完整自定义
+python tests/test_infer.py \
+    --prompt "中国的首都城市是" \
+    --max_new_tokens 256 \
+    --temperature 0.1 \
+    --top_k 50 \
+    --repetition_penalty 1.2 \
+    --n_loops 4 \
+    --device cpu \
+    --checkpoint_dir /root/autodl-tmp/checkpoints_act/
+
+
+python tests/eval_ppl.py \
+    --n_loops 4 
+
 ```
 
 Key design choices:

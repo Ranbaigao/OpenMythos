@@ -28,7 +28,6 @@ from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 from contextlib import nullcontext
 
 from datasets import load_dataset
-from torch.utils.tensorboard import SummaryWriter
 
 from open_mythos import OpenMythos
 from open_mythos.main import TransformerBlock, RecurrentBlock, Expert
@@ -66,8 +65,7 @@ class SkyworkDataset(IterableDataset):
     针对 BAAI/CCI3.0 的流式数据加载器，支持多卡 Sharding 与 take() 截断调试。
     """
 
-    def __init__(self, encoding, seq_len: int, rank: int, world_size: int, 
-                max_docs_per_worker: int = None,  skip_docs_per_worker: int = 0):
+    def __init__(self, encoding, seq_len: int, rank: int, world_size: int, max_docs_per_worker: int = None):
         """
         Args:
             encoding              -- tokenizer 对象
@@ -82,48 +80,25 @@ class SkyworkDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.max_docs_per_worker = max_docs_per_worker
-        self.skip_docs_per_worker = skip_docs_per_worker  
 
     def __iter__(self):
         worker = get_worker_info()
         num_workers = worker.num_workers if worker else 1
         worker_id = worker.id if worker else 0
-        
-        
-        # 强制环境变量
-        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        os.environ["CURL_CA_BUNDLE"] = ""      # 禁用 requests 的 SSL 验证
-        os.environ["REQUESTS_CA_BUNDLE"] = "" 
-        
-        import huggingface_hub
-        if hasattr(huggingface_hub, "constants"):
-            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = False
-            huggingface_hub.constants.HUGGINGFACE_CO_URL = "https://hf-mirror.com"
-            huggingface_hub.constants.HF_HUB_HTTP_ENDPOINT = "https://hf-mirror.com"
-
-        
 
         total_shards = self.world_size * num_workers
         shard_index = self.rank * num_workers + worker_id
-        
-        
-        # 将日志级别设置为 DEBUG，这会打印所有信息
-        datasets.logging.set_verbosity_debug()  # 
+
         # 1. 加载 BAAI/CCI3.0 数据集（不需要像 fineweb 那样指定 name="sample-10BT"）
         ds = load_dataset(
             "Skywork/SkyPile-150B",
             split="train",
             streaming=True,
-            trust_remote_code=True # 如果 HF 提示需要执行官方脚本，把这行注释打开
+            # trust_remote_code=True # 如果 HF 提示需要执行官方脚本，把这行注释打开
         )
 
         # 2. 先 Shard，确保当前 Worker 拿到属于自己那份不重复的数据流
         ds = ds.shard(num_shards=total_shards, index=shard_index)
-        
-        
-        # 2. 先 Skip：跳过上一版已经训练过的文档
-        if self.skip_docs_per_worker > 0:
-            ds = ds.skip(self.skip_docs_per_worker)
 
         # 3. [核心修改] 后 Take。强制当前 Worker 只读取指定的条数，然后结束迭代
         if self.max_docs_per_worker is not None:
@@ -250,31 +225,6 @@ def get_lr(step: int, warmup: int, total: int, max_lr: float, min_lr: float) -> 
         return min_lr
     decay = (step - warmup) / (total - warmup)
     return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * decay))
-
-
-def fmt_eta(seconds: float) -> str:
-    """
-    Format a duration in seconds as a compact human-readable ETA.
-
-    Picks the largest unit that holds a non-zero value and keeps the next
-    unit for sub-day precision. Avoids printing huge second counts that are
-    useless at a glance, and avoids the opposite trap of showing only `H:MM`
-    which loses information once a run spans multiple days.
-
-    Examples:
-        45       → "45s"
-        754      → "12m34s"
-        5025     → "1h23m"
-        192345   → "2d5h"
-    """
-    s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m{s % 60:02d}s"
-    if s < 86400:
-        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
-    return f"{s // 86400}d{(s % 86400) // 3600}h"
 
 
 # ---------------------------------------------------------------------------
@@ -500,23 +450,20 @@ def main():
     # ------------------------------------------------------------------
     # Hyperparameters
     # ------------------------------------------------------------------
-    seq_len = 2048
+    seq_len = 1024
     micro_batch = 1
-    target_tokens = 3_000_000_000
-    # grad_accum = max(1, 256 // (world_size * micro_batch))
-    grad_accum = 64
-    
+    target_tokens = 30_000_000_000
+    grad_accum = max(1, 256 // (world_size * micro_batch))
     global_batch_tok = world_size * micro_batch * grad_accum * seq_len
     total_steps = target_tokens // global_batch_tok
     warmup_steps = 2000
     lr = 3e-4
     wd = 0.1
     log_every = 1
-    ckpt_every = 500
+    ckpt_every = 1000
     ckpt_dir = "checkpoints"
     dataset_subset = "sample-10BT"  # → sample-100BT or "default" for full run
-    attention_type = 'gqa'
-    
+
     if master:
         logger.info(
             f"seq_len={seq_len} | micro_batch={micro_batch} | grad_accum={grad_accum} | "
@@ -530,9 +477,7 @@ def main():
     cfg = mythos_1b()
     cfg.vocab_size = vocab_size
     cfg.max_seq_len = seq_len
-    cfg.attn_type = attention_type
-    
-    
+
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
 
@@ -553,26 +498,7 @@ def main():
             mixed_precision=mp_policy,
             auto_wrap_policy=wrap_policy,
             device_id=local_rank,
-            use_orig_params=True,  # 👈 必须加上这行保命！
         )
-        # ======== 【修复核心：非重入式引擎 + 取消嵌套】 ========
-        # 1. 强制使用现代的 NO_REENTRANT 后端，这是官方强烈推荐与 FSDP 配合的模式
-        non_reentrant_wrapper = partial(
-            checkpoint_wrapper,
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-        )
-        
-        # ======== 【新增：开启激活重计算】 ========
-        # 只对前后向结构稳定的 TransformerBlock 做重计算；跳过 recurrent
-        # loop 里的 MoE / ACT 路径，避免 checkpoint 重算图和原始前向不一致。
-        # check_fn = lambda submodule: isinstance(submodule, TransformerBlock)
-        # apply_activation_checkpointing(
-        #     model,
-        #     checkpoint_wrapper_fn=non_reentrant_wrapper,
-        #     check_fn=check_fn,
-        # )
-        # =========================================
-        
     else:
         model = model.to(device)
         amp_ctx = (
@@ -583,12 +509,7 @@ def main():
 
     # FSDP handles its own mixed precision; only need autocast for single-GPU
     amp_ctx = nullcontext() if ddp else amp_ctx  # type: ignore[possibly-undefined]
-    # amp_ctx = (
-    #     torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
-    #     if "cuda" in device
-    #     else nullcontext()
-    # )
-    
+
     if master:
         n_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Parameters: {n_params:,}  |  AMP dtype: {amp_dtype}")
@@ -625,8 +546,7 @@ def main():
         seq_len=seq_len, 
         rank=rank, 
         world_size=world_size,
-        # max_docs_per_worker=500_000,  # <--- 加上这个参数
-        # skip_docs_per_worker=500_000
+        max_docs_per_worker=500  # <--- 加上这个参数
     )
     # dataset = FineWebEduDataset(encoding, seq_len, dataset_subset, rank, world_size)
     loader = DataLoader(dataset, batch_size=micro_batch, num_workers=4, pin_memory=True)
@@ -634,29 +554,13 @@ def main():
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    # TensorBoard writer only on master rank — non-master ranks skip
-    # logging entirely (both for the writer API and any scalar ops), so
-    # the variable must be defined on every rank even though it is unused.
-    writer = None
     if master:
         os.makedirs(ckpt_dir, exist_ok=True)
-        # TensorBoard logs land under `runs/` so they sit alongside the
-        # checkpoint tree (already gitignored). Each run gets its own
-        # event file; reusing the same directory on resume would mix two
-        # streams into one curve in the UI.
-        tb_dir = os.path.join("runs", os.path.basename(os.path.abspath(ckpt_dir)))
-        writer = SummaryWriter(log_dir=tb_dir, flush_secs=10)
-        logger.info(f"TensorBoard logs -> {tb_dir}")
 
     model.train()
     data_iter = iter(loader)
     t0 = time.perf_counter()
     step = start_step
-    # Anchor for the per-window step counter. When `start_step` is not a
-    # multiple of `log_every` (resumed mid-run), the first window has fewer
-    # than `log_every` steps; dividing by `log_every` would inflate throughput
-    # and shrink the ETA. Track the real step delta instead.
-    last_log_step = start_step
 
     while step < total_steps:
         cur_lr = get_lr(step, warmup_steps, total_steps, lr, lr * 0.1)
@@ -690,12 +594,14 @@ def main():
 
             loss.backward()
             loss_accum += loss.item()
-            # if master:
-            #     logger.info(
-            #         f"step {step:6d}/{total_steps} | micro {micro_step + 1:3d}/{grad_accum} "
-            #         f"| loss {loss.item():.4f} | accum {loss_accum:.4f} "
-            #         f"| x {x.dtype} y {y.dtype} | sync={'no_sync' if ddp and micro_step != grad_accum - 1 else 'sync'}"
-            #     )
+
+            if master:
+                logger.info(
+                    f"step {step:6d}/{total_steps} | micro {micro_step + 1:3d}/{grad_accum} "
+                    f"| loss {loss.item():.4f} | accum {loss_accum:.4f} "
+                    f"| x {x.dtype} y {y.dtype} | sync={'no_sync' if ddp and micro_step != grad_accum - 1 else 'sync'}"
+                )
+
         # FSDP shards parameters, so `nn.utils.clip_grad_norm_` would clip
         # against each rank's local norm and miss the cross-shard gather.
         # FSDP.clip_grad_norm_ computes the true global norm and returns it.
@@ -708,40 +614,15 @@ def main():
 
         if master and step % log_every == 0:
             dt = time.perf_counter() - t0
-            # Use the real step delta over this window, not `log_every` —
-            # otherwise a resumed run whose `start_step` is not a multiple of
-            # `log_every` would report its first window as a full window's
-            # worth of work in less wall time, doubling the throughput and
-            # halving the ETA.
-            steps_in_window = step - last_log_step
-            tokens_in_window = steps_in_window * global_batch_tok
-            tok_per_sec = tokens_in_window / dt
+            tok_per_sec = global_batch_tok * log_every / dt
             tokens_seen = step * global_batch_tok
-            # Average wall time per step over this window × remaining steps.
-            # Extrapolating from a recent window (not since start) keeps the
-            # ETA responsive if the rate shifts after warmup or a recovery
-            # from a stalled batch.
-            step_dt = dt / steps_in_window
-            eta_secs = (total_steps - step) * step_dt
             logger.info(
                 f"step {step:6d}/{total_steps} | loss {loss_accum:.4f} "
                 f"| gnorm {float(grad_norm):.2f} | lr {cur_lr:.2e} "
-                f"| {tok_per_sec / 1e3:.2f}k tok/s "
-                f"| {tokens_seen / 1e9:.1f}B tokens seen "
-                f"| {step_dt:.2f}s/step "
-                f"| eta {fmt_eta(eta_secs)}"
+                f"| {tok_per_sec / 1e6:.2f}M tok/s "
+                f"| {tokens_seen / 1e9:.1f}B tokens seen"
             )
-            # TensorBoard scalars. Same window-aggregated metrics as the
-            # log line above, but separate fields so each one gets its own
-            # curve and the y-axis can scale per-metric (loss vs. gnorm
-            # otherwise squashes into a flat line near the bottom).
-            writer.add_scalar("train/loss", loss_accum, step)
-            writer.add_scalar("train/grad_norm", float(grad_norm), step)
-            writer.add_scalar("train/lr", cur_lr, step)
-            writer.add_scalar("train/tokens_per_sec", tok_per_sec, step)
-            writer.add_scalar("train/step_seconds", step_dt, step)
             t0 = time.perf_counter()
-            last_log_step = step
 
         if step % ckpt_every == 0:
             save_checkpoint(
@@ -761,12 +642,6 @@ def main():
 
     if master:
         logger.success("Training complete.")
-
-    # Flush any pending scalar events before exit — if the script is
-    # killed by signal rather than exiting the loop cleanly, the unflushed
-    # tail of the event file is lost. Closing also forces the final write.
-    if writer is not None:
-        writer.close()
 
 
 if __name__ == "__main__":

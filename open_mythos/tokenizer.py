@@ -34,10 +34,17 @@ class MythosTokenizer:
         """
         Return the size of the tokenizer vocabulary.
 
+        Uses `len(tokenizer)` rather than `tokenizer.vocab_size` because the
+        latter excludes any added special tokens; `encode()` can still
+        produce IDs for those added tokens, and an nn.Embedding sized from
+        the smaller `tokenizer.vocab_size` would then be indexed
+        out-of-bounds (CUDA device-side assert on `gather`).
+
         Returns:
-            int: The number of unique tokens in the tokenizer vocabulary.
+            int: The number of unique tokens in the tokenizer vocabulary,
+                including added special tokens.
         """
-        return self.tokenizer.vocab_size
+        return len(self.tokenizer)
 
     def encode(self, text: str) -> list[int]:
         """

@@ -5,6 +5,64 @@ from open_mythos.main import MythosConfig
 #   MoE   = 3 * dim * expert_dim * (n_experts + n_shared * n_experts_per_tok)
 # expert_dim is solved from the residual budget after all other terms.
 
+def mythos_0_1b() -> MythosConfig:
+    """1B parameter config. Small research/fine-tuning model. dim=2048, 64 experts, 16 loop iters, 4k context."""
+    return MythosConfig(
+        vocab_size=32000,
+        dim=2048,
+        n_heads=16,
+        n_kv_heads=2,
+        max_seq_len=4096,
+        max_loop_iters=4,
+        prelude_layers=2,
+        coda_layers=2,
+        attn_type="gqa",
+        
+        kv_lora_rank=256,
+        q_lora_rank=512,
+        qk_rope_head_dim=32,
+        qk_nope_head_dim=64,
+        v_head_dim=64,
+        
+        n_experts=16,
+        n_shared_experts=2,
+        n_experts_per_tok=4,
+        expert_dim=2048,
+        act_threshold=0.99,
+        rope_theta=500000.0,
+        lora_rank=4,
+    )
+
+
+def mythos_0_5b() -> MythosConfig:
+    """1B parameter config. Small research/fine-tuning model. dim=2048, 64 experts, 16 loop iters, 4k context."""
+    return MythosConfig(
+        vocab_size=32000,
+        dim=2048,
+        n_heads=16,
+        n_kv_heads=2,
+        max_seq_len=4096,
+        max_loop_iters=4,
+        prelude_layers=2,
+        coda_layers=2,
+        attn_type="gqa",
+        
+        kv_lora_rank=256,
+        q_lora_rank=512,
+        qk_rope_head_dim=32,
+        qk_nope_head_dim=64,
+        v_head_dim=64,
+        
+        n_experts=8,
+        n_shared_experts=2,
+        n_experts_per_tok=4,
+        expert_dim=2048,
+        act_threshold=0.99,
+        rope_theta=500000.0,
+        lora_rank=4,
+    )
+
+
 
 def mythos_1b() -> MythosConfig:
     """1B parameter config. Small research/fine-tuning model. dim=2048, 64 experts, 16 loop iters, 4k context."""
@@ -23,7 +81,8 @@ def mythos_1b() -> MythosConfig:
         qk_rope_head_dim=32,
         qk_nope_head_dim=64,
         v_head_dim=64,
-        n_experts=64,
+        
+        n_experts=32,
         n_shared_experts=2,
         n_experts_per_tok=4,
         expert_dim=2048,
@@ -41,7 +100,7 @@ def mythos_3b() -> MythosConfig:
         n_heads=24,
         n_kv_heads=6,
         max_seq_len=4096,
-        max_loop_iters=16,
+        max_loop_iters=8,
         prelude_layers=2,
         coda_layers=2,
         attn_type="mla",
