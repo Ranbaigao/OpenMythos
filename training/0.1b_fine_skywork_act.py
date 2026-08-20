@@ -1124,8 +1124,14 @@ def main():
 
         optim_muon.zero_grad()
         optim_adamw.zero_grad()
-        loss_accum = 0.0
-        ponder_accum = 0.0
+        # Accumulate on-device as 0-dim tensors: the previous float
+        # accumulators needed task_loss.item()/ponder.item() every micro-step,
+        # which is a CUDA->CPU sync that stalls the async kernel pipeline
+        # (2 syncs x grad_accum micro-steps per optimizer step). Now the only
+        # syncs happen at logging time, once per log window.
+        accum_device = torch.device(device if not ddp else f"cuda:{local_rank}")
+        loss_accum = torch.zeros((), device=accum_device, dtype=torch.float32)
+        ponder_accum = torch.zeros((), device=accum_device, dtype=torch.float32)
         loops_max = 0.0
         data_wait = 0.0
         fwd_bwd = 0.0
@@ -1172,8 +1178,8 @@ def main():
                 ponder_pen = torch.relu(ponder_all - ponder_budget).mean()
                 loss = (task_loss + ponder_tau * ponder_pen) / grad_accum
             loss.backward()
-            loss_accum += task_loss.item() / grad_accum
-            ponder_accum += ponder.item() / grad_accum
+            loss_accum += task_loss.detach().float() / grad_accum
+            ponder_accum += ponder.detach().float() / grad_accum
             loops_max = max(loops_max, act["loops"])
             fwd_bwd += time.perf_counter() - t_fb
             # print('444')
@@ -1210,6 +1216,10 @@ def main():
         step += 1
         # print('666')
         if master and step % log_every == 0:
+            # The one place the GPU accumulators are read back — a single
+            # sync point per log window instead of two per micro-step.
+            loss_value = loss_accum.item()
+            ponder_value = ponder_accum.item()
             dt = time.perf_counter() - t0
             # Use the real step delta over this window, not `log_every` —
             # otherwise a resumed run whose `start_step` is not a multiple of
@@ -1227,11 +1237,11 @@ def main():
             step_dt = dt / steps_in_window
             eta_secs = (total_steps - step) * step_dt
             logger.info(
-                f"step {step:6d}/{total_steps} | loss {loss_accum:.4f} "
+                f"step {step:6d}/{total_steps} | loss {loss_value:.4f} "
                 f"| gnorm {float(grad_norm):.2f} "
                 f"| gnorm_muon {float(muon_grad_norm):.2f} "
                 f"| lr_a {cur_lr:.2e} | lr_m {cur_muon_lr:.2e} "
-                f"| pond {ponder_accum:.2f} | loops {loops_max:.0f} "
+                f"| pond {ponder_value:.2f} | loops {loops_max:.0f} "
                 f"| data {data_wait:.1f}s | fb {fwd_bwd:.1f}s | opt {optim_time:.1f}s "
                 f"| {tok_per_sec / 1e3:.2f}k tok/s "
                 f"| {tokens_seen / 1e9:.1f}B tokens seen "
@@ -1242,7 +1252,7 @@ def main():
             # log line above, but separate fields so each one gets its own
             # curve and the y-axis can scale per-metric (loss vs. gnorm
             # otherwise squashes into a flat line near the bottom).
-            writer.add_scalar("train/loss", loss_accum, step)
+            writer.add_scalar("train/loss", loss_value, step)
             writer.add_scalar("train/grad_norm", float(grad_norm), step)
             writer.add_scalar("train/grad_norm_muon", float(muon_grad_norm), step)
             # AdamW and Muon follow independent LR schedules with different
@@ -1264,7 +1274,7 @@ def main():
             # drift is the early warning of depth collapse, and act_loops (max
             # loops any micro-batch actually executed) is what maps directly
             # to step_seconds.
-            writer.add_scalar("train/ponder", ponder_accum, step)
+            writer.add_scalar("train/ponder", ponder_value, step)
             writer.add_scalar("train/act_loops", loops_max, step)
             # Wall-clock time this step spent waiting on the data stream.
             # This is the direct evidence for data-vs-compute bottleneck
